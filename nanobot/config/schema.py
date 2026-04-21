@@ -64,6 +64,28 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class MGPConfig(Base):
+    """MGP sidecar configuration for governed memory recall/commit.
+
+    Default ``enabled=false`` keeps nanobot's behavior byte-identical when MGP
+    is not configured: no ``mgp_client`` import, no ``recall_memory`` tool, no
+    ``mgp-memory`` skill in the system prompt. Flip ``enabled=true`` to opt in.
+    """
+
+    enabled: bool = False                                      # master switch
+    gateway_url: str = "http://127.0.0.1:8080"                 # MGP gateway HTTP base URL
+    timeout: float = 5.0                                       # per-request timeout in seconds
+    fail_open: bool = True                                     # swallow MGP errors so recall failures never break a turn
+    workspace_as_tenant: bool = True                           # use workspace path as tenant_id when tenant_id is unset
+    tenant_id: str | None = None                               # explicit tenant_id; overrides workspace_as_tenant
+    actor_agent: str = "nanobot/main"                          # identity recorded in audit logs
+    api_key: str | None = None                                 # bearer token when gateway auth_mode=api_key
+    enable_consolidator_commit: bool = True                    # write Consolidator bullets to MGP
+    enable_dream_commit: bool = True                           # write Dream Phase-1 tags to MGP
+    recall_default_scope: str = "user"                         # default scope when agent omits it
+    recall_default_limit: int = Field(default=5, ge=1, le=20)  # default top-K when agent omits it
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -90,6 +112,7 @@ class AgentDefaults(Base):
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    mgp: MGPConfig = Field(default_factory=MGPConfig)  # opt-in MGP sidecar (default disabled)
 
 
 class AgentsConfig(Base):

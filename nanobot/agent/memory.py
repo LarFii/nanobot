@@ -20,6 +20,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.utils.gitstore import GitStore
 
 if TYPE_CHECKING:
+    from nanobot.agent.mgp.sidecar import AsyncMGPSidecar
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session, SessionManager
 
@@ -420,10 +421,31 @@ class Consolidator:
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        # Optional MGP sidecar; injected by AgentLoop when mgp.enabled=true.
+        # When None (default) the commit hook in archive() is a no-op.
+        self.mgp_sidecar: AsyncMGPSidecar | None = None
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    def _runtime_for_session(self, session: Session) -> Any:
+        """Build a runtime state for an MGP commit triggered by *session*.
+
+        Parses the conventional ``channel:chat_id`` shape of session keys.
+        Returns ``Any`` because :class:`RuntimeState` lives in the optional
+        mgp module — only callable when ``self.mgp_sidecar`` is set.
+        """
+        assert self.mgp_sidecar is not None
+        if session.key and ":" in session.key:
+            channel, chat_id = session.key.split(":", 1)
+        else:
+            channel, chat_id = "cli", session.key or "direct"
+        return self.mgp_sidecar.build_runtime(
+            channel=channel,
+            chat_id=chat_id,
+            session_key=session.key,
+        )
 
     def pick_consolidation_boundary(
         self,
@@ -486,8 +508,18 @@ class Consolidator:
             self._get_tool_definitions(),
         )
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    async def archive(
+        self,
+        messages: list[dict],
+        session: Session | None = None,
+    ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
+
+        When ``session`` is provided AND an MGP sidecar is wired in AND
+        ``mgp.enable_consolidator_commit`` is true, the produced bullet
+        summary is also forwarded to the MGP gateway as a background task
+        (commit channel B). The MGP write is fire-and-forget — its outcome
+        does not affect the return value or the session's local archive.
 
         Returns the summary text on success, None if nothing to archive.
         """
@@ -514,11 +546,29 @@ class Consolidator:
                 raise RuntimeError(f"LLM returned error: {response.content}")
             summary = response.content or "[no summary]"
             self.store.append_history(summary)
+            self._maybe_commit_to_mgp(session, summary)
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
             self.store.raw_archive(messages)
             return None
+
+    def _maybe_commit_to_mgp(self, session: Session | None, summary: str) -> None:
+        """Best-effort fan-out of a Consolidator summary to MGP.
+
+        Uses ``asyncio.create_task`` because we never want a slow MGP gateway
+        to block the consolidation path. ``self.mgp_sidecar`` is opt-in; when
+        absent (the default) this is a one-attribute lookup and returns.
+        """
+        if self.mgp_sidecar is None or session is None:
+            return
+        if not self.mgp_sidecar.config.enable_consolidator_commit:
+            return
+        try:
+            runtime = self._runtime_for_session(session)
+            asyncio.create_task(self.mgp_sidecar.commit_bullets(runtime, summary))
+        except Exception:
+            logger.exception("MGP consolidator commit dispatch failed (ignored)")
 
     async def maybe_consolidate_by_tokens(
         self,
@@ -597,7 +647,7 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
+                summary = await self.archive(chunk, session=session)
                 if summary:
                     last_summary = summary
                 else:
@@ -669,6 +719,23 @@ class Dream:
         self.annotate_line_ages = annotate_line_ages
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
+        # Optional MGP sidecar; injected by AgentLoop when mgp.enabled=true.
+        # Used in run() to mirror Phase-1 [USER]/[MEMORY]/[SOUL] tags into MGP.
+        self.mgp_sidecar: AsyncMGPSidecar | None = None
+
+    def _workspace_runtime(self) -> Any:
+        """Build a runtime state for an MGP commit triggered by Dream.
+
+        Dream operates at workspace scope (cron-driven, no per-user channel),
+        so we synthesize a synthetic "system:dream" routing key. The sidecar
+        derives ``user_id`` / ``tenant_id`` per its standard rules.
+        """
+        assert self.mgp_sidecar is not None
+        return self.mgp_sidecar.build_runtime(
+            channel="system",
+            chat_id="dream",
+            session_key="system:dream",
+        )
 
     # -- tool registry -------------------------------------------------------
 
@@ -835,6 +902,21 @@ class Dream:
         except Exception:
             logger.exception("Dream Phase 1 failed")
             return False
+
+        # Commit channel C: mirror Phase-1 [USER]/[MEMORY]/[SOUL] tags into MGP.
+        # Fire-and-forget — never block the local Dream pipeline on MGP.
+        if (
+            self.mgp_sidecar is not None
+            and self.mgp_sidecar.config.enable_dream_commit
+            and analysis
+        ):
+            try:
+                runtime = self._workspace_runtime()
+                asyncio.create_task(
+                    self.mgp_sidecar.commit_dream_tags(runtime, analysis)
+                )
+            except Exception:
+                logger.exception("MGP dream commit dispatch failed (ignored)")
 
         # Phase 2: Delegate to AgentRunner with read_file / edit_file
         existing_skills = self._list_existing_skills()
