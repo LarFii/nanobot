@@ -42,7 +42,14 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
+    from nanobot.agent.mgp.sidecar import AsyncMGPSidecar
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        MGPConfig,
+        ToolsConfig,
+        WebToolsConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -161,6 +168,7 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
+        mgp_config: "MGPConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -255,6 +263,32 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+        # MGP sidecar (opt-in, default disabled). When enabled we register the
+        # `recall_memory` tool and inject the sidecar reference into the
+        # Consolidator/Dream so their LLM-extracted facts also flow to MGP.
+        # When disabled we suppress the `mgp-memory` skill so the LLM is not
+        # told about a tool that does not exist in this loop.
+        self.mgp_sidecar: AsyncMGPSidecar | None = None
+        if mgp_config is not None and mgp_config.enabled:
+            from nanobot.agent.mgp import build_sidecar
+            from nanobot.agent.tools.mgp_recall import MGPRecallTool
+
+            self.mgp_sidecar = build_sidecar(
+                mgp_config,
+                workspace_id=str(workspace.expanduser().resolve()),
+            )
+            self.consolidator.mgp_sidecar = self.mgp_sidecar
+            self.dream.mgp_sidecar = self.mgp_sidecar
+            self.tools.register(MGPRecallTool(
+                sidecar=self.mgp_sidecar,
+                default_scope=mgp_config.recall_default_scope,
+                default_limit=mgp_config.recall_default_limit,
+            ))
+        else:
+            # Hide the always-on mgp-memory skill so the LLM doesn't see a
+            # phantom recall_memory tool when MGP isn't enabled.
+            self.context.skills.disabled_skills.add("mgp-memory")
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = (
@@ -321,10 +355,13 @@ class AgentLoop:
         # Compute the effective session key (accounts for unified sessions)
         # so that subagent results route to the correct pending queue.
         effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
-        for name in ("message", "spawn", "cron", "my"):
+        # `recall_memory` joins the spawn branch because its `set_context`
+        # signature is `(channel, chat_id, effective_key=None)`, identical to
+        # SpawnTool — so it inherits unified-session-aware key derivation.
+        for name in ("message", "spawn", "cron", "my", "recall_memory"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    if name == "spawn":
+                    if name in ("spawn", "recall_memory"):
                         tool.set_context(channel, chat_id, effective_key=effective_key)
                     else:
                         tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
