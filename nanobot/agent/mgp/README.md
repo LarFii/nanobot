@@ -106,6 +106,19 @@ Two — and only two — channels write to MGP:
 | B — Consolidator bullets | Token budget exceeded / autocompact / `/new`       | LLM-extracted bullets from `consolidator_archive.md` — one `MemoryCandidate` per bullet        | `mgp.enable_consolidator_commit`    |
 | C — Dream Phase-1 tags   | Cron every 2h / `/dream`                           | LLM-extracted `[USER]` / `[MEMORY]` / `[SOUL]` lines from `dream_phase1.md`                    | `mgp.enable_dream_commit`           |
 
+**Tag → MGP `(scope, type)` mapping for Dream Phase-1 commits**:
+
+| Dream tag  | MGP scope | MGP memory type   | Rationale                                                                                              |
+| ---------- | --------- | ----------------- | ------------------------------------------------------------------------------------------------------ |
+| `[USER]`   | `user`    | `preference`      | User-specific facts (location, language, taste)                                                        |
+| `[MEMORY]` | `agent`   | `semantic_fact`   | Stable shared knowledge surfaced by Dream                                                              |
+| `[SOUL]`   | `agent`   | `profile`         | Agent identity / persona facts. Note: MGP has no `identity` type — `profile` is the canonical mapping. |
+
+Memory types align with the MGP spec's `supported_memory_types` set
+(`profile / preference / episodic_event / semantic_fact / procedural_rule
+/ relationship / checkpoint_pointer / artifact_summary`) — the gateway
+will reject any other type with `MGP_INVALID_OBJECT`.
+
 **Never written to MGP**: raw user messages, raw assistant replies, tool call
 results, LLM `<thinking>`, `history.jsonl` entries themselves, the contents of
 `MEMORY.md` / `SOUL.md` / `USER.md`, media attachments, API keys, secrets.
@@ -164,6 +177,10 @@ agents:
   defaults:
     mgp:
       enabled: true
+      # Recommended: pin a stable subject id so Dream-extracted [USER] facts
+      # land where CLI/channel sessions can find them. Without this the
+      # subject defaults to getpass.getuser() (the OS login).
+      default_user_id: "alice"
 ```
 
 Restart nanobot. Use `/mgp-status` to verify the connection. Ask the agent
@@ -190,10 +207,36 @@ All fields live under `agents.defaults.mgp` in nanobot config.
 | `enable_dream_commit`          | `true`                        | Mirror Dream Phase-1 tags to MGP.                                    |
 | `recall_default_scope`         | `"user"`                      | Default `scope` when the agent omits it in `recall_memory(...)`.     |
 | `recall_default_limit`         | `5`                           | Default `limit` when the agent omits it. Capped at 20.               |
+| `default_user_id`              | `null`                        | Stable subject id used by Dream commits and CLI direct sessions when no real per-user identifier exists. Falls back to `getpass.getuser()` when null. **Set this in SDK / multi-tenant deployments** so Dream-extracted `[USER]` facts land under a discoverable subject. |
 
 There is **no `mode` / `shadow` field** — recall is agent-driven, so there is
 no auto-injection vs no-injection toggle. Granular control is through the
 two `enable_*_commit` flags.
+
+### Subject (`user_id`) derivation
+
+The MGP subject under which a memory is written / searched is resolved
+per-call from routing context with the following priority:
+
+1. `sender_id` from the inbound message (e.g. group-chat member id from
+   Telegram / Discord / WhatsApp / Slack — a real per-person identifier).
+2. `chat_id` if it is not a synthetic placeholder (`direct`, `dream`, `user`).
+3. `session_key` tail when present and not synthetic.
+4. `mgp.default_user_id` from your config.
+5. `getpass.getuser()` (the OS login).
+
+**Why this matters**: Dream runs at workspace scope and uses the synthetic
+`chat_id="dream"`. Without a configured `default_user_id`, every Dream
+`[USER]` fact would land under subject `"dream"` (or `getpass.getuser()`),
+not under the subject your CLI/channel session uses for recall — making
+those facts effectively unreachable. Always set `default_user_id` for
+SDK-only deployments and any setup where multiple bot instances should
+share one subject.
+
+For group chats, the inbound `sender_id` is plumbed all the way down to
+`build_runtime` (see `_set_tool_context` in `agent/loop.py`), so each
+member gets their own user-scoped memory island even though the `chat_id`
+is shared.
 
 ---
 
@@ -404,11 +447,12 @@ The error message from `build_sidecar` includes this exact hint.
 
 ### Group chat shows the same memory across users
 
-Known limitation: routing context (`_set_tool_context`) does not currently
-include `sender_id`, so all members of a group chat share the same `chat_id`
-as their `user_id`. 1:1 channels (CLI, Telegram DM, Discord DM) are isolated
-correctly. Tracking a future upstream change to expose `sender_id` to tools
-would close this gap.
+Make sure your channel implementation populates `InboundMessage.sender_id`
+with the real per-person id (not the chat/room id). The loop now plumbs
+`sender_id` through `_set_tool_context` → `recall_memory.set_context`
+→ `sidecar.build_runtime`, but only if the channel actually sets it. If a
+custom channel leaves it empty, recall will fall back to `chat_id` and
+collapse all group members onto one subject again.
 
 ### Latency spike after enabling MGP with a SaaS backend
 
