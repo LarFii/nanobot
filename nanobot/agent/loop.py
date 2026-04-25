@@ -268,8 +268,9 @@ class AgentLoop:
         register_builtin_commands(self.commands)
 
         # MGP sidecar (opt-in, default disabled). When enabled we register the
-        # `recall_memory` tool and inject the sidecar reference into the
-        # Consolidator/Dream so their LLM-extracted facts also flow to MGP.
+        # `recall_memory` tool and install hooks on Consolidator/Dream so their
+        # LLM-extracted facts also flow to MGP. The Consolidator/Dream classes
+        # themselves stay MGP-unaware — see _wire_mgp_hooks below.
         # When disabled we suppress the `mgp-memory` skill so the LLM is not
         # told about a tool that does not exist in this loop.
         self.mgp_sidecar: AsyncMGPSidecar | None = None
@@ -281,8 +282,7 @@ class AgentLoop:
                 mgp_config,
                 workspace_id=str(workspace.expanduser().resolve()),
             )
-            self.consolidator.mgp_sidecar = self.mgp_sidecar
-            self.dream.mgp_sidecar = self.mgp_sidecar
+            self._wire_mgp_hooks(self.mgp_sidecar)
             self.tools.register(MGPRecallTool(
                 sidecar=self.mgp_sidecar,
                 default_scope=mgp_config.recall_default_scope,
@@ -292,6 +292,43 @@ class AgentLoop:
             # Hide the always-on mgp-memory skill so the LLM doesn't see a
             # phantom recall_memory tool when MGP isn't enabled.
             self.context.skills.disabled_skills.add("mgp-memory")
+
+    def _wire_mgp_hooks(self, sidecar: "AsyncMGPSidecar") -> None:
+        """Wire Consolidator/Dream MGP commits via their post-processing hooks.
+
+        Keeps memory.py free of any MGP imports; all sidecar interaction is
+        owned here by AgentLoop.
+        """
+
+        def _runtime_for_session(session: Any) -> Any:
+            if session.key and ":" in session.key:
+                channel, chat_id = session.key.split(":", 1)
+            else:
+                channel, chat_id = "cli", session.key or "direct"
+            return sidecar.build_runtime(
+                channel=channel,
+                chat_id=chat_id,
+                session_key=session.key,
+            )
+
+        def _on_archive(session: Any, summary: str) -> None:
+            if not sidecar.config.enable_consolidator_commit:
+                return
+            runtime = _runtime_for_session(session)
+            asyncio.create_task(sidecar.commit_bullets(runtime, summary))
+
+        def _on_phase1_analysis(analysis: str) -> None:
+            if not sidecar.config.enable_dream_commit:
+                return
+            runtime = sidecar.build_runtime(
+                channel="system",
+                chat_id="dream",
+                session_key="system:dream",
+            )
+            asyncio.create_task(sidecar.commit_dream_tags(runtime, analysis))
+
+        self.consolidator.on_archive = _on_archive
+        self.dream.on_phase1_analysis = _on_phase1_analysis
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""

@@ -317,72 +317,60 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_mgp_status(ctx: CommandContext) -> OutboundMessage:
-    """Show MGP sidecar status: connection, last recall, last commits."""
+    """Show MGP sidecar status: gateway, toggles, last recall, last 32 commits."""
     loop = ctx.loop
     msg = ctx.msg
     sidecar = getattr(loop, "mgp_sidecar", None)
+    md = {**dict(msg.metadata or {}), "render_as": "text"}
 
     if sidecar is None:
-        content = (
-            "MGP sidecar not enabled.\n\n"
-            "To enable: install the optional dependency, run an MGP gateway, "
-            "and set `agents.defaults.mgp.enabled: true` in your config. "
-            "See `nanobot/agent/mgp/README.md` for the full quickstart."
-        )
         return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id,
-            content=content, metadata={**dict(msg.metadata or {}), "render_as": "text"},
+            channel=msg.channel, chat_id=msg.chat_id, metadata=md,
+            content=(
+                "MGP sidecar disabled. Set `agents.defaults.mgp.enabled: true` and run "
+                "an `mgp-gateway`. See `nanobot/agent/mgp/README.md`."
+            ),
         )
 
     cfg = sidecar.config
-    tool_present = bool(loop.tools.get("recall_memory"))
-    lines: list[str] = ["## MGP Sidecar Status", ""]
-    lines.append(f"- enabled: `{cfg.enabled}`")
-    lines.append(f"- gateway: `{cfg.gateway_url}`")
-    lines.append(f"- recall_memory tool: {'registered' if tool_present else 'NOT registered'}")
-    lines.append(f"- consolidator commit: {'on' if cfg.enable_consolidator_commit else 'off'}")
-    lines.append(f"- dream commit: {'on' if cfg.enable_dream_commit else 'off'}")
-    lines.append(f"- fail_open: `{cfg.fail_open}`")
-    if cfg.tenant_id:
-        lines.append(f"- tenant_id: `{cfg.tenant_id}`")
-    elif cfg.workspace_as_tenant:
-        lines.append("- tenant_id: workspace (auto)")
+    commit_flags = (
+        f"consolidator={'on' if cfg.enable_consolidator_commit else 'off'}, "
+        f"dream={'on' if cfg.enable_dream_commit else 'off'}"
+    )
+    lines = [
+        "## MGP Sidecar",
+        f"- gateway: `{cfg.gateway_url}` (fail_open=`{cfg.fail_open}`)",
+        f"- commits: {commit_flags}",
+    ]
 
-    last_recall = sidecar.last_recall
-    lines.append("")
-    lines.append("### Last recall")
-    if last_recall is None:
-        lines.append("(no recall yet this run)")
+    r = sidecar.last_recall
+    if r is None:
+        lines.append("- last recall: (none)")
+    elif r.degraded:
+        lines.append(
+            f"- last recall: `{sidecar.last_recall_query}` "
+            f"degraded `{r.error_code}` — {r.error_message}"
+        )
     else:
         latency = sidecar.last_recall_latency_ms
-        lines.append(f"- query: `{sidecar.last_recall_query}`")
-        lines.append(f"- executed: `{last_recall.executed}`, degraded: `{last_recall.degraded}`")
-        lines.append(f"- hits: {len(last_recall.results)}")
-        if latency is not None:
-            lines.append(f"- latency: {latency:.0f} ms")
-        if last_recall.degraded:
-            lines.append(f"- error: `{last_recall.error_code}` — {last_recall.error_message}")
+        lat = f", {latency:.0f}ms" if latency is not None else ""
+        lines.append(
+            f"- last recall: `{sidecar.last_recall_query}` "
+            f"hits={len(r.results)}{lat}"
+        )
 
-    last_commits = sidecar.last_commits
-    lines.append("")
-    lines.append("### Recent commits")
-    if not last_commits:
-        lines.append("(no commits recorded yet this run)")
+    commits = sidecar.last_commits
+    if not commits:
+        lines.append("- last commits: (none)")
     else:
-        written = sum(1 for c in last_commits if c.written)
-        failed = sum(1 for c in last_commits if not c.executed)
-        lines.append(f"- recorded: {len(last_commits)} (kept up to 32)")
-        lines.append(f"- written: {written}")
-        lines.append(f"- failed: {failed}")
-        if failed:
-            err_sample = next((c for c in reversed(last_commits) if not c.executed), None)
-            if err_sample is not None:
-                lines.append(f"- last error: `{err_sample.error_code}` — {err_sample.error_message}")
+        written = sum(1 for c in commits if c.written)
+        failed = sum(1 for c in commits if not c.executed)
+        tail = f"; last error `{commits[-1].error_code}`" if failed and not commits[-1].executed else ""
+        lines.append(f"- last commits: {len(commits)} (written={written}, failed={failed}){tail}")
 
     return OutboundMessage(
-        channel=msg.channel, chat_id=msg.chat_id,
+        channel=msg.channel, chat_id=msg.chat_id, metadata=md,
         content="\n".join(lines),
-        metadata={**dict(msg.metadata or {}), "render_as": "text"},
     )
 
 

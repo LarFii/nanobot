@@ -4,9 +4,12 @@ Confirms the wiring contract between :class:`AgentLoop` and the optional
 sidecar:
 
 - when ``mgp.enabled=false`` the sidecar is never built, the recall_memory
-  tool is never registered, and the ``mgp-memory`` skill is suppressed
+  tool is never registered, the Consolidator/Dream hooks stay None, and the
+  ``mgp-memory`` skill is suppressed
 - when ``mgp.enabled=true`` the sidecar is built once, the tool is
-  registered, and the Consolidator + Dream both receive the sidecar reference
+  registered, and AgentLoop installs the ``on_archive`` /
+  ``on_phase1_analysis`` hooks so Consolidator + Dream output flows to MGP
+  without those classes ever importing ``mgp_client`` themselves
 - ``recall_memory`` joins the spawn branch of ``_set_tool_context``
 
 We monkeypatch :func:`build_sidecar` so these tests don't require a real MGP
@@ -72,9 +75,9 @@ def test_disabled_mgp_does_not_build_sidecar(tmp_path, monkeypatch) -> None:
 
     assert loop.mgp_sidecar is None
     assert loop.tools.get("recall_memory") is None
-    # Consolidator and Dream stay vanilla.
-    assert loop.consolidator.mgp_sidecar is None
-    assert loop.dream.mgp_sidecar is None
+    # Consolidator and Dream stay MGP-unaware: their hooks are uninstalled.
+    assert loop.consolidator.on_archive is None
+    assert loop.dream.on_phase1_analysis is None
 
 
 def test_disabled_mgp_suppresses_mgp_memory_skill(tmp_path, monkeypatch) -> None:
@@ -98,11 +101,12 @@ def test_enabled_mgp_builds_sidecar_and_registers_tool(tmp_path, monkeypatch) ->
     assert "mgp-memory" not in loop.context.skills.disabled_skills
 
 
-def test_enabled_mgp_injects_sidecar_into_consolidator_and_dream(tmp_path, monkeypatch) -> None:
+def test_enabled_mgp_installs_hooks_on_consolidator_and_dream(tmp_path, monkeypatch) -> None:
+    """AgentLoop owns the MGP-side wiring: Consolidator/Dream just expose hooks."""
     cfg = MGPConfig(enabled=True)
     loop = _make_loop(tmp_path, mgp_config=cfg, monkeypatch=monkeypatch)
-    assert loop.consolidator.mgp_sidecar is loop._fake_sidecar
-    assert loop.dream.mgp_sidecar is loop._fake_sidecar
+    assert callable(loop.consolidator.on_archive)
+    assert callable(loop.dream.on_phase1_analysis)
 
 
 def test_set_tool_context_routes_recall_memory_via_spawn_branch(tmp_path, monkeypatch) -> None:
@@ -207,3 +211,37 @@ async def test_consolidator_archive_skips_commit_without_session(tmp_path, monke
     summary = await loop.consolidator.archive(msgs)  # no session=
     assert summary == "- a fact"
     loop._fake_sidecar.commit_bullets.assert_not_called()
+
+
+# -- Dream → MGP wiring (post-decouple regression) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_dream_phase1_hook_dispatches_commit_when_enabled(tmp_path, monkeypatch) -> None:
+    """Dream.on_phase1_analysis must hand the analysis to commit_dream_tags."""
+    import asyncio as _aio
+
+    cfg = MGPConfig(enabled=True)
+    loop = _make_loop(tmp_path, mgp_config=cfg, monkeypatch=monkeypatch)
+    loop._fake_sidecar.commit_dream_tags = AsyncMock(return_value=[])
+
+    analysis = "[USER] prefers concise replies\n[MEMORY] uses python 3.11"
+    loop.dream.on_phase1_analysis(analysis)
+
+    pending = [t for t in _aio.all_tasks() if not t.done() and t is not _aio.current_task()]
+    if pending:
+        await _aio.gather(*pending, return_exceptions=True)
+
+    loop._fake_sidecar.commit_dream_tags.assert_awaited()
+    call_args = loop._fake_sidecar.commit_dream_tags.await_args.args
+    assert call_args[1] == analysis
+
+
+@pytest.mark.asyncio
+async def test_dream_phase1_hook_skips_commit_when_disabled(tmp_path, monkeypatch) -> None:
+    cfg = MGPConfig(enabled=True, enable_dream_commit=False)
+    loop = _make_loop(tmp_path, mgp_config=cfg, monkeypatch=monkeypatch)
+    loop._fake_sidecar.commit_dream_tags = AsyncMock(return_value=[])
+
+    loop.dream.on_phase1_analysis("[USER] foo")
+    loop._fake_sidecar.commit_dream_tags.assert_not_called()

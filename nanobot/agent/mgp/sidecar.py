@@ -104,9 +104,8 @@ class AsyncMGPSidecar:
                like ``"user"``)
             2. ``chat_id`` (when not a synthetic placeholder like ``"direct"``
                or ``"dream"``)
-            3. ``session_key.split(":", 1)[1]`` (parses ``channel:chat_id``)
-            4. ``config.default_user_id`` (configured fallback)
-            5. ``getpass.getuser()`` (OS login — keeps separate workstations /
+            3. ``config.default_user_id`` (configured fallback)
+            4. ``getpass.getuser()`` (OS login — keeps separate workstations /
                accounts isolated even when nothing is configured)
 
         Treating ``"direct"``/``"dream"`` as synthetic is critical for the
@@ -130,11 +129,7 @@ class AsyncMGPSidecar:
         elif resolved_chat_id and resolved_chat_id not in _SYNTHETIC_USER_IDS:
             user_id = resolved_chat_id
         else:
-            tail = resolved_session_key.split(":", 1)[1] if ":" in resolved_session_key else ""
-            if tail and tail not in _SYNTHETIC_USER_IDS:
-                user_id = tail
-            else:
-                user_id = self._default_user_id()
+            user_id = self._default_user_id()
 
         if self.config.tenant_id:
             tenant_id = self.config.tenant_id
