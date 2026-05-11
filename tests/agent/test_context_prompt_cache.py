@@ -87,6 +87,42 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Return exactly: OK" in user_content
 
 
+def test_runtime_context_includes_sender_id_when_provided(tmp_path) -> None:
+    """Sender ID should be included in runtime context when provided."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Return exactly: OK",
+        channel="cli",
+        chat_id="direct",
+        sender_id="user-12345",
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Sender ID: user-12345" in user_content
+
+
+def test_runtime_context_excludes_sender_id_when_not_provided(tmp_path) -> None:
+    """Sender ID should not be present in runtime context when not provided."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Return exactly: OK",
+        channel="cli",
+        chat_id="direct",
+        sender_id=None,
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Sender ID:" not in user_content
+
+
 def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
     """Entries in history.jsonl not yet consumed by Dream appear with timestamps."""
     workspace = _make_workspace(tmp_path)
@@ -188,6 +224,17 @@ def test_identity_has_no_behavioral_instructions(tmp_path) -> None:
     assert "Execution Rules" not in identity
 
 
+def test_system_prompt_does_not_warn_about_message_time_markers(tmp_path) -> None:
+    """Parroting is prevented by not annotating assistant turns in history;
+    no prompt-level warning about ``[Message Time: ...]`` is needed."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "Message Time" not in prompt
+
+
 def test_default_soul_template_contains_execution_rules() -> None:
     """Default SOUL.md template must contain execution rules with act/plan layering."""
     soul = (pkg_files("nanobot") / "templates" / "SOUL.md").read_text(encoding="utf-8")
@@ -240,6 +287,18 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
     system = messages[0]["content"]
     assert "Format Hint" in system
     assert "messaging app" in system
+
+
+def test_system_prompt_keeps_message_tool_out_of_current_chat_replies(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt(channel="slack")
+
+    assert "Do not use the 'message' tool for normal replies in the current chat" in prompt
+    assert "the runtime attaches those artifacts to the final assistant reply automatically" in prompt
+    assert "do not call 'message' just to announce or resend them" in prompt
+    assert "Wait for the tool results, then answer once" in prompt
 
 
 def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path) -> None:

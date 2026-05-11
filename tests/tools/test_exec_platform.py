@@ -112,33 +112,31 @@ class TestSpawnUnix:
 class TestSpawnWindows:
 
     @pytest.mark.asyncio
-    async def test_uses_comspec_from_env(self):
+    async def test_uses_create_subprocess_shell(self):
         env = {"COMSPEC": r"C:\Windows\system32\cmd.exe", "PATH": ""}
         with (
             patch("nanobot.agent.tools.shell._IS_WINDOWS", True),
-            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("asyncio.create_subprocess_shell", new_callable=AsyncMock) as mock_shell,
         ):
-            mock_exec.return_value = AsyncMock()
-            await ExecTool._spawn("dir", r"C:\Users", env)
+            mock_shell.return_value = AsyncMock()
+            await ExecTool._spawn("dir", r"C:\work", env)
 
-        args = mock_exec.call_args[0]
-        assert "cmd.exe" in args[0]
-        assert "/c" in args
+        args = mock_shell.call_args[0]
         assert "dir" in args
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_default_comspec(self):
-        env = {"PATH": ""}
+    async def test_passes_cwd_and_env(self):
+        env = {"PATH": "/usr/bin"}
         with (
             patch("nanobot.agent.tools.shell._IS_WINDOWS", True),
-            patch.dict("os.environ", {}, clear=True),
-            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("asyncio.create_subprocess_shell", new_callable=AsyncMock) as mock_shell,
         ):
-            mock_exec.return_value = AsyncMock()
-            await ExecTool._spawn("dir", r"C:\Users", env)
+            mock_shell.return_value = AsyncMock()
+            await ExecTool._spawn("echo hi", r"C:\work", env)
 
-        args = mock_exec.call_args[0]
-        assert args[0] == "cmd.exe"
+        kwargs = mock_shell.call_args[1]
+        assert kwargs["cwd"] == r"C:\work"
+        assert kwargs["env"] == env
 
 
 # ---------------------------------------------------------------------------
@@ -148,23 +146,33 @@ class TestSpawnWindows:
 class TestPathAppendPlatform:
 
     @pytest.mark.asyncio
-    async def test_unix_injects_export(self):
-        """On Unix, path_append is an export statement prepended to command."""
+    async def test_unix_uses_env_var_in_fixed_export(self):
+        """On Unix, path_append must not be interpolated into shell source."""
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"ok", b"")
         mock_proc.returncode = 0
 
+        captured_cmd = None
+        captured_env = {}
+
+        async def capture_spawn(cmd, cwd, env):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            captured_env.update(env)
+            return mock_proc
+
         with (
             patch("nanobot.agent.tools.shell._IS_WINDOWS", False),
-            patch.object(ExecTool, "_spawn", return_value=mock_proc) as mock_spawn,
+            patch("nanobot.agent.tools.shell.os.pathsep", ":"),
+            patch.object(ExecTool, "_spawn", side_effect=capture_spawn),
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
-            tool = ExecTool(path_append="/opt/bin")
+            tool = ExecTool(path_append="/opt/bin; echo INJECTED")
             await tool.execute(command="ls")
 
-        spawned_cmd = mock_spawn.call_args[0][0]
-        assert 'export PATH="$PATH:/opt/bin"' in spawned_cmd
-        assert spawned_cmd.endswith("ls")
+        assert captured_cmd == 'export PATH="$PATH:$NANOBOT_PATH_APPEND"; ls'
+        assert captured_env["NANOBOT_PATH_APPEND"] == "/opt/bin; echo INJECTED"
+        assert "INJECTED" not in captured_cmd
 
     @pytest.mark.asyncio
     async def test_windows_modifies_env(self):
@@ -181,6 +189,7 @@ class TestPathAppendPlatform:
 
         with (
             patch("nanobot.agent.tools.shell._IS_WINDOWS", True),
+            patch("nanobot.agent.tools.shell.os.pathsep", ";"),
             patch.object(ExecTool, "_spawn", side_effect=capture_spawn),
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):

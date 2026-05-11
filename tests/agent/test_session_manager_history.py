@@ -1,4 +1,4 @@
-from nanobot.session.manager import Session
+from nanobot.session.manager import Session, SessionManager
 
 
 def _assert_no_orphans(history: list[dict]) -> None:
@@ -29,6 +29,18 @@ def _tool_turn(prefix: str, idx: int) -> list[dict]:
         {"role": "tool", "tool_call_id": f"{prefix}_{idx}_a", "name": "x", "content": "ok"},
         {"role": "tool", "tool_call_id": f"{prefix}_{idx}_b", "name": "y", "content": "ok"},
     ]
+
+
+def test_list_sessions_includes_metadata_title(tmp_path):
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:chat-title")
+    session.metadata["title"] = "自动生成标题"
+    manager.save(session)
+
+    rows = manager.list_sessions()
+
+    assert rows[0]["key"] == "websocket:chat-title"
+    assert rows[0]["title"] == "自动生成标题"
 
 
 # --- Original regression test (from PR 2075) ---
@@ -180,6 +192,7 @@ def test_get_history_preserves_reasoning_content():
         "role": "assistant",
         "content": "done",
         "reasoning_content": "hidden chain of thought",
+        "thinking_blocks": [{"type": "thinking", "thinking": "hidden chain of thought", "signature": "sig"}],
     })
 
     history = session.get_history(max_messages=500)
@@ -190,8 +203,88 @@ def test_get_history_preserves_reasoning_content():
             "role": "assistant",
             "content": "done",
             "reasoning_content": "hidden chain of thought",
+            "thinking_blocks": [{
+                "type": "thinking",
+                "thinking": "hidden chain of thought",
+                "signature": "sig",
+            }],
         },
     ]
+
+
+def test_get_history_annotates_user_turns_but_not_assistant_turns():
+    """Only user turns carry the timestamp prefix.
+
+    Annotating assistant turns trains the model (via in-context examples) to
+    start its own replies with ``[Message Time: ...]``. User-side stamps are
+    enough to pin adjacent assistant replies for relative-time reasoning.
+    """
+    session = Session(key="test:timestamps")
+    session.messages.append({
+        "role": "user",
+        "content": "10 点提醒是昨天发生的",
+        "timestamp": "2026-04-26T22:00:00",
+    })
+    session.messages.append({
+        "role": "assistant",
+        "content": "记下来了",
+        "timestamp": "2026-04-26T22:00:05",
+    })
+
+    history = session.get_history(max_messages=500, include_timestamps=True)
+
+    assert history == [
+        {
+            "role": "user",
+            "content": "[Message Time: 2026-04-26T22:00:00]\n10 点提醒是昨天发生的",
+        },
+        {
+            "role": "assistant",
+            "content": "记下来了",
+        },
+    ]
+
+
+def test_get_history_does_not_annotate_proactive_assistant_deliveries_with_timestamps():
+    """Assistant-side timestamp examples can leak back into future replies."""
+    session = Session(key="test:proactive-timestamps")
+    session.messages.append({
+        "role": "assistant",
+        "content": "记得喝水",
+        "timestamp": "2026-04-26T15:00:00",
+        "_channel_delivery": True,
+    })
+    session.messages.append({
+        "role": "user",
+        "content": "好",
+        "timestamp": "2026-04-26T18:00:00",
+    })
+
+    history = session.get_history(max_messages=500, include_timestamps=True)
+
+    assert history == [
+        {
+            "role": "assistant",
+            "content": "记得喝水",
+        },
+        {
+            "role": "user",
+            "content": "[Message Time: 2026-04-26T18:00:00]\n好",
+        },
+    ]
+
+
+def test_get_history_does_not_annotate_tool_results_with_timestamps():
+    session = Session(key="test:tool-timestamps")
+    session.messages.append({"role": "user", "content": "run tool"})
+    session.messages.extend(_tool_turn("ts", 0))
+    session.messages[-1]["timestamp"] = "2026-04-26T22:00:10"
+
+    history = session.get_history(max_messages=500, include_timestamps=True)
+
+    tool_result = history[-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["content"] == "ok"
 
 
 # --- Window cuts mid-group: assistant present but some tool results orphaned ---
@@ -269,3 +362,101 @@ def test_get_history_ignores_media_kwarg_on_non_user_rows():
     # List content is passed through verbatim — the synthesizer only
     # rewrites plain-string content.
     assert history[0]["content"] == [{"type": "text", "text": "structured"}]
+
+
+def test_get_history_does_not_paste_assistant_media_paths_into_replay():
+    session = Session(key="test:assistant-media")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "来了 🎨",
+            "media": ["/home/user/.nanobot/media/generated/img_abc.png"],
+        }
+    )
+
+    history = session.get_history(max_messages=500)
+
+    assert history == [{"role": "assistant", "content": "来了 🎨"}]
+
+
+def test_get_history_sanitizes_existing_assistant_replay_artifacts():
+    session = Session(key="test:polluted-assistant")
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": (
+                "[Message Time: 2026-05-09 00:33:48]\n"
+                "来了 🎨\n"
+                "[image: /home/user/.nanobot/media/generated/img_old.png]\n\n"
+                "generate_image(\"16:9\")\n"
+                "message(\"来了 🎨\")"
+            ),
+        }
+    )
+
+    history = session.get_history(max_messages=500, include_timestamps=True)
+
+    assert history == [{"role": "assistant", "content": "来了 🎨"}]
+
+
+def test_get_history_respects_max_tokens(monkeypatch):
+    session = Session(key="test:token-cap")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+            {"role": "assistant", "content": "a3"},
+        ]
+    )
+
+    token_map = {"u1": 50, "a1": 50, "u2": 50, "a2": 50, "u3": 50, "a3": 50}
+    monkeypatch.setattr(
+        "nanobot.session.manager.estimate_message_tokens",
+        lambda message: token_map.get(message.get("content"), 0),
+    )
+
+    history = session.get_history(max_messages=500, max_tokens=120)
+    assert [m["content"] for m in history] == ["u3", "a3"]
+
+
+def test_get_history_recovers_user_when_token_slice_would_be_assistant_only(monkeypatch):
+    session = Session(key="test:assistant-only-slice")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+    )
+    token_map = {"u1": 100, "a1": 100, "u2": 100, "a2": 100}
+    monkeypatch.setattr(
+        "nanobot.session.manager.estimate_message_tokens",
+        lambda message: token_map.get(message.get("content"), 0),
+    )
+
+    history = session.get_history(max_messages=500, max_tokens=100)
+    assert [m["content"] for m in history] == ["u2", "a2"]
+
+
+def test_retain_recent_legal_suffix_hard_cap_with_long_non_user_chain():
+    session = Session(key="test:hard-cap-chain")
+    session.messages.append({"role": "user", "content": "u0"})
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+            ],
+        }
+    )
+    for i in range(12):
+        session.messages.append({"role": "assistant", "content": f"a{i}"})
+
+    session.retain_recent_legal_suffix(6)
+
+    assert len(session.messages) <= 6

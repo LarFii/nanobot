@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ChevronRight, FileIcon, ImageIcon, PlaySquare, Wrench } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ChevronRight, Copy, FileIcon, ImageIcon, PlaySquare, Wrench } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ImageLightbox } from "@/components/ImageLightbox";
@@ -21,7 +21,32 @@ interface MessageBubbleProps {
  * collapsible group so intermediate steps never masquerade as replies.
  */
 export function MessageBubble({ message }: MessageBubbleProps) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  const copyResetRef = useRef<number | null>(null);
   const baseAnim = "animate-in fade-in-0 slide-in-from-bottom-1 duration-300";
+
+  useEffect(() => {
+    return () => {
+      if (copyResetRef.current !== null) {
+        window.clearTimeout(copyResetRef.current);
+      }
+    };
+  }, []);
+
+  const onCopyAssistantReply = useCallback(() => {
+    if (!navigator.clipboard) return;
+    void navigator.clipboard.writeText(message.content).then(() => {
+      setCopied(true);
+      if (copyResetRef.current !== null) {
+        window.clearTimeout(copyResetRef.current);
+      }
+      copyResetRef.current = window.setTimeout(() => {
+        setCopied(false);
+        copyResetRef.current = null;
+      }, 1_500);
+    });
+  }, [message.content]);
 
   if (message.kind === "trace") {
     return <TraceGroup message={message} animClass={baseAnim} />;
@@ -48,7 +73,7 @@ export function MessageBubble({ message }: MessageBubbleProps) {
           <p
             className={cn(
               "ml-auto w-fit rounded-[18px] bg-secondary/70 px-4 py-2",
-              "text-left text-[18px]/[1.8] whitespace-pre-wrap break-words",
+              "text-left text-[16px]/[1.75] whitespace-pre-wrap break-words",
             )}
           >
             {message.content}
@@ -60,8 +85,9 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 
   const empty = message.content.trim().length === 0;
   const media = message.media ?? [];
+  const showAssistantActions = message.role === "assistant" && !message.isStreaming && !empty;
   return (
-    <div className={cn("w-full text-sm", baseAnim)} style={{ lineHeight: "var(--cjk-line-height)" }}>
+    <div className={cn("w-full text-[15px]", baseAnim)} style={{ lineHeight: "var(--cjk-line-height)" }}>
       {empty && message.isStreaming ? (
         <TypingDots />
       ) : (
@@ -69,6 +95,27 @@ export function MessageBubble({ message }: MessageBubbleProps) {
           <MarkdownText>{message.content}</MarkdownText>
           {message.isStreaming && <StreamCursor />}
           {media.length > 0 ? <MessageMedia media={media} align="left" /> : null}
+          {showAssistantActions ? (
+            <div className="mt-2 flex items-center gap-1 text-muted-foreground">
+              <button
+                type="button"
+                onClick={onCopyAssistantReply}
+                aria-label={copied ? t("message.copiedReply") : t("message.copyReply")}
+                title={copied ? t("message.copiedReply") : t("message.copyReply")}
+                className={cn(
+                  "inline-flex h-8 w-8 items-center justify-center rounded-full",
+                  "transition-colors hover:bg-muted/55 hover:text-foreground",
+                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                )}
+              >
+                {copied ? (
+                  <Check className="h-4 w-4" aria-hidden />
+                ) : (
+                  <Copy className="h-4 w-4" aria-hidden />
+                )}
+              </button>
+            </div>
+          ) : null}
         </>
       )}
     </div>
@@ -95,7 +142,9 @@ function MessageMedia({
         align === "right" ? "justify-end" : "justify-start",
       )}
     >
-      {images.length > 0 ? <UserImages images={images} align={align} /> : null}
+      {images.length > 0 ? (
+        <UserImages images={images} align={align} size={align === "left" ? "large" : "compact"} />
+      ) : null}
       {nonImages.map((item, i) => (
         <MediaCell key={`${item.url ?? item.name ?? item.kind}-${i}`} media={item} />
       ))}
@@ -161,9 +210,11 @@ function MediaCell({ media }: { media: UIMediaAttachment }) {
 function UserImages({
   images,
   align = "right",
+  size = "compact",
 }: {
   images: UIImage[];
   align?: "left" | "right";
+  size?: "compact" | "large";
 }) {
   const { t } = useTranslation();
   // Only real-URL images can open in the lightbox; historical-replay
@@ -183,6 +234,7 @@ function UserImages({
       <div
         className={cn(
           "flex flex-wrap items-end gap-2",
+          size === "large" && "gap-3",
           align === "right" ? "ml-auto justify-end" : "mr-auto justify-start",
         )}
       >
@@ -190,6 +242,7 @@ function UserImages({
           <UserImageCell
             key={`${img.url ?? "placeholder"}-${i}`}
             image={img}
+            size={size}
             placeholderLabel={t("message.imageAttachment")}
             openLabel={t("lightbox.open")}
             onOpen={
@@ -214,18 +267,23 @@ function UserImages({
 
 function UserImageCell({
   image,
+  size,
   placeholderLabel,
   openLabel,
   onOpen,
 }: {
   image: UIImage;
+  size: "compact" | "large";
   placeholderLabel: string;
   openLabel: string;
   onOpen?: () => void;
 }) {
   const hasUrl = typeof image.url === "string" && image.url.length > 0;
   const tileClasses = cn(
-    "relative h-24 w-24 overflow-hidden rounded-[14px] border border-border/60 bg-muted/40",
+    "relative overflow-hidden border border-border/60 bg-muted/40",
+    size === "large"
+      ? "w-[min(100%,34rem)] rounded-[20px] bg-transparent"
+      : "h-24 w-24 rounded-[14px]",
     "shadow-[0_6px_18px_-14px_rgba(0,0,0,0.45)]",
   );
 
@@ -235,11 +293,10 @@ function UserImageCell({
         type="button"
         onClick={onOpen}
         aria-label={image.name ? `${openLabel}: ${image.name}` : openLabel}
-        title={image.name ?? undefined}
         className={cn(
           tileClasses,
-          "cursor-zoom-in transition-transform duration-150 motion-reduce:transition-none",
-          "hover:scale-[1.02] hover:ring-2 hover:ring-primary/30",
+          "block cursor-zoom-in p-0 transition-transform duration-150 motion-reduce:transition-none",
+          "hover:scale-[1.01] hover:ring-2 hover:ring-primary/25",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
         )}
       >
@@ -249,7 +306,12 @@ function UserImageCell({
           loading="lazy"
           decoding="async"
           draggable={false}
-          className="h-full w-full object-cover"
+          className={cn(
+            "block",
+            size === "large"
+              ? "h-auto max-h-[36rem] w-full rounded-[inherit] object-contain"
+              : "h-full w-full object-cover",
+          )}
         />
       </button>
     );

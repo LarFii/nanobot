@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -90,6 +91,8 @@ _SYNTHETIC_USER_CONTENT = "(conversation continued)"
 
 class LLMProvider(ABC):
     """Base class for LLM providers."""
+
+    supports_progress_deltas = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _PERSISTENT_MAX_DELAY = 60
@@ -641,14 +644,12 @@ class LLMProvider(ABC):
                         return value
             return None
 
-        try:
+        with suppress(TypeError, ValueError):
             retry_ms = _header_value("retry-after-ms")
             if retry_ms is not None:
                 value = float(retry_ms) / 1000.0
                 if value > 0:
                     return value
-        except (TypeError, ValueError):
-            pass
 
         retry_after = _header_value("retry-after")
         if retry_after is None:

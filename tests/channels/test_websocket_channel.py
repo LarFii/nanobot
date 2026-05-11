@@ -26,6 +26,8 @@ from nanobot.channels.websocket import (
     _parse_query,
     _parse_request_path,
 )
+from nanobot.config.loader import load_config, save_config
+from nanobot.config.schema import Config
 
 # -- Shared helpers (aligned with test_websocket_integration.py) ---------------
 
@@ -166,6 +168,40 @@ def test_issue_route_secret_matches_empty_secret() -> None:
 
 
 @pytest.mark.asyncio
+async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> None:
+    channel = _ch(bus)
+    conn = MagicMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {"type": "message", "chat_id": "chat-1", "content": "hello", "webui": True},
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert msg.channel == "websocket"
+    assert msg.chat_id == "chat-1"
+    assert msg.metadata["webui"] is True
+    assert msg.metadata["_wants_stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_plain_websocket_message_does_not_mark_webui(bus: MagicMock) -> None:
+    channel = _ch(bus)
+    conn = MagicMock()
+
+    await channel._dispatch_envelope(
+        conn,
+        "custom-client",
+        {"type": "message", "chat_id": "chat-1", "content": "hello"},
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert "webui" not in msg.metadata
+
+
+@pytest.mark.asyncio
 async def test_send_delivers_json_message_with_media_and_reply() -> None:
     bus = MagicMock()
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
@@ -178,6 +214,7 @@ async def test_send_delivers_json_message_with_media_and_reply() -> None:
         content="hello",
         reply_to="m1",
         media=["/tmp/a.png"],
+        buttons=[["Yes", "No"]],
     )
     await channel.send(msg)
 
@@ -185,9 +222,11 @@ async def test_send_delivers_json_message_with_media_and_reply() -> None:
     payload = json.loads(mock_ws.send.call_args[0][0])
     assert payload["event"] == "message"
     assert payload["chat_id"] == "chat-1"
-    assert payload["text"] == "hello"
+    assert payload["text"] == "hello\n\n1. Yes\n2. No"
+    assert payload["button_prompt"] == "hello"
     assert payload["reply_to"] == "m1"
     assert payload["media"] == ["/tmp/a.png"]
+    assert payload["buttons"] == [["Yes", "No"]]
 
 
 @pytest.mark.asyncio
@@ -280,6 +319,44 @@ async def test_send_delta_emits_delta_and_stream_end() -> None:
     assert second["event"] == "stream_end"
     assert second["chat_id"] == "chat-1"
     assert second["stream_id"] == "sid"
+
+
+@pytest.mark.asyncio
+async def test_send_turn_end_emits_turn_end_event() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={"_turn_end": True},
+    ))
+
+    mock_ws.send.assert_awaited_once()
+    body = json.loads(mock_ws.send.await_args.args[0])
+    assert body == {"event": "turn_end", "chat_id": "chat-1"}
+
+
+@pytest.mark.asyncio
+async def test_send_session_updated_emits_session_updated_event() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={"_session_updated": True},
+    ))
+
+    mock_ws.send.assert_awaited_once()
+    body = json.loads(mock_ws.send.await_args.args[0])
+    assert body == {"event": "session_updated", "chat_id": "chat-1"}
 
 
 @pytest.mark.asyncio
@@ -437,6 +514,142 @@ async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock
 
 
 @pytest.mark.asyncio
+async def test_settings_api_returns_safe_subset_and_updates_whitelist(
+    bus: MagicMock,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    port = 29891
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.agents.defaults.model = "openai/gpt-4o"
+    config.providers.openai.api_key = "secret-key"
+    config.tools.web.search.provider = "brave"
+    config.tools.web.search.api_key = "brave-secret"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    channel = _ch(bus, port=port)
+    channel._api_tokens["tok"] = time.monotonic() + 300
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+
+    try:
+        settings = await _http_get(
+            f"http://127.0.0.1:{port}/api/settings",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert settings.status_code == 200
+        body = settings.json()
+        assert body["agent"]["model"] == "openai/gpt-4o"
+        assert body["agent"]["provider"] == "openai"
+        providers = {provider["name"]: provider for provider in body["providers"]}
+        assert providers["openai"]["configured"] is True
+        assert providers["openai"]["api_key_hint"] == "secr••••-key"
+        assert providers["openrouter"]["configured"] is False
+        assert body["agent"]["has_api_key"] is True
+        assert body["web_search"]["provider"] == "brave"
+        assert body["web_search"]["api_key_hint"] == "brav••••cret"
+        search_providers = {provider["name"]: provider for provider in body["web_search"]["providers"]}
+        assert search_providers["duckduckgo"]["credential"] == "none"
+        assert search_providers["searxng"]["credential"] == "base_url"
+        assert "secret-key" not in settings.text
+        assert "brave-secret" not in settings.text
+
+        provider_updated = await _http_get(
+            "http://127.0.0.1:"
+            f"{port}/api/settings/provider/update?provider=openrouter"
+            "&api_key=sk-or-test&api_base=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert provider_updated.status_code == 200
+        provider_body = provider_updated.json()
+        assert provider_body["requires_restart"] is False
+        provider_rows = {provider["name"]: provider for provider in provider_body["providers"]}
+        assert provider_rows["openrouter"]["configured"] is True
+        assert "sk-or-test" not in provider_updated.text
+
+        updated = await _http_get(
+            "http://127.0.0.1:"
+            f"{port}/api/settings/update?model=openrouter/test"
+            "&provider=openrouter",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["requires_restart"] is False
+
+        search_updated = await _http_get(
+            "http://127.0.0.1:"
+            f"{port}/api/settings/web-search/update?provider=searxng"
+            "&base_url=https%3A%2F%2Fsearch.example.com",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert search_updated.status_code == 200
+        search_body = search_updated.json()
+        assert search_body["requires_restart"] is False
+        assert search_body["web_search"]["provider"] == "searxng"
+        assert search_body["web_search"]["api_key_hint"] is None
+        assert search_body["web_search"]["base_url"] == "https://search.example.com"
+
+        saved = load_config(config_path)
+        assert saved.agents.defaults.model == "openrouter/test"
+        assert saved.agents.defaults.provider == "openrouter"
+        assert saved.providers.openrouter.api_key == "sk-or-test"
+        assert saved.providers.openrouter.api_base == "https://openrouter.ai/api/v1"
+        assert saved.tools.web.search.provider == "searxng"
+        assert saved.tools.web.search.api_key == ""
+        assert saved.tools.web.search.base_url == "https://search.example.com"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_commands_api_returns_slash_command_metadata(bus: MagicMock) -> None:
+    port = 29892
+    channel = _ch(bus, port=port)
+    channel._api_tokens["tok"] = time.monotonic() + 300
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+
+    try:
+        denied = await _http_get(f"http://127.0.0.1:{port}/api/commands")
+        assert denied.status_code == 401
+
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/commands",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        commands = {row["command"]: row for row in body["commands"]}
+        assert commands["/stop"]["title"] == "Stop current task"
+        assert commands["/history"]["arg_hint"] == "[n]"
+        assert all("description" in row for row in body["commands"])
+    finally:
+        await channel.stop()
+        await server_task
+
+
+def test_settings_payload_normalizes_camel_case_provider(
+    bus: MagicMock,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.agents.defaults.provider = "minimaxAnthropic"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    body = _ch(bus)._settings_payload()
+
+    assert body["agent"]["provider"] == "minimax_anthropic"
+
+
+@pytest.mark.asyncio
 async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMock) -> None:
     port = 29880
     channel = _ch(bus, port=port, streaming=True)
@@ -474,6 +687,16 @@ async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMoc
             end = json.loads(await client.recv())
             assert end["event"] == "stream_end"
             assert end["stream_id"] == "s1"
+
+            await channel.send(OutboundMessage(
+                channel="websocket",
+                chat_id=chat_id,
+                content="",
+                metadata={"_turn_end": True},
+            ))
+
+            turn_end = json.loads(await client.recv())
+            assert turn_end == {"event": "turn_end", "chat_id": chat_id}
     finally:
         await channel.stop()
         await server_task

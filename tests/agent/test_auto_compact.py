@@ -2,20 +2,23 @@
 
 import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import AgentDefaults
 from nanobot.command import CommandContext
+from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse
 
 
-def _make_loop(tmp_path: Path, session_ttl_minutes: int = 15) -> AgentLoop:
+def _make_loop(
+    tmp_path: Path,
+    session_ttl_minutes: int = 15,
+) -> AgentLoop:
     """Create a minimal AgentLoop for testing."""
     bus = MessageBus()
     provider = MagicMock()
@@ -72,6 +75,11 @@ class TestSessionTTLConfig:
         assert data["idleCompactAfterMinutes"] == 30
         assert "sessionTtlMinutes" not in data
 
+    def test_session_file_cap_is_internal_constant(self):
+        """Session file cap should remain an internal constant, not a config field."""
+        from nanobot.session.manager import FILE_MAX_MESSAGES
+        assert FILE_MAX_MESSAGES == 2000
+
 
 class TestAgentLoopTTLParam:
     """Test that AutoCompact receives and stores session_ttl_minutes."""
@@ -85,6 +93,75 @@ class TestAgentLoopTTLParam:
         """AutoCompact default TTL should be 0 (disabled)."""
         loop = _make_loop(tmp_path, session_ttl_minutes=0)
         assert loop.auto_compact._ttl == 0
+
+    @pytest.mark.asyncio
+    async def test_process_message_reads_history_with_token_budget(self, tmp_path):
+        """_process_message should pass an auto-derived token budget to get_history."""
+        loop = _make_loop(tmp_path)
+        session = loop.sessions.get_or_create("cli:direct")
+        session.get_history = MagicMock(return_value=[])
+        loop.context.build_messages = MagicMock(return_value=[])
+        loop._run_agent_loop = AsyncMock(return_value=("ok", [], [], "stop", False))
+        loop._save_turn = MagicMock()
+
+        msg = InboundMessage(
+            channel="cli",
+            sender_id="u1",
+            chat_id="direct",
+            content="hello",
+        )
+        await loop._process_message(msg)
+        session.get_history.assert_called_once()
+        kwargs = session.get_history.call_args.kwargs
+        assert isinstance(kwargs.get("max_tokens"), int)
+        assert kwargs["max_tokens"] > 0
+        assert kwargs["include_timestamps"] is True
+
+    @pytest.mark.asyncio
+    async def test_session_file_cap_archives_and_trims_old_messages(self, tmp_path):
+        loop = _make_loop(tmp_path)
+        loop.context.memory.raw_archive = MagicMock()
+
+        for i in range(4):
+            msg = InboundMessage(
+                channel="cli",
+                sender_id="u1",
+                chat_id="direct",
+                content=f"hello {i}",
+            )
+            await loop._process_message(msg)
+
+        session = loop.sessions.get_or_create("cli:direct")
+        from nanobot.session.manager import FILE_MAX_MESSAGES
+        assert len(session.messages) <= FILE_MAX_MESSAGES
+
+    def test_session_enforce_file_cap_skips_archive_when_dropped_prefix_already_consolidated(self, tmp_path):
+        from nanobot.session.manager import Session
+        archive_fn = MagicMock()
+        session = Session(key="cli:direct")
+        for i in range(8):
+            session.add_message("user", f"u{i}")
+        session.last_consolidated = 6
+
+        session.enforce_file_cap(on_archive=archive_fn, limit=4)
+
+        assert len(session.messages) <= 4
+        archive_fn.assert_not_called()
+
+    def test_session_enforce_file_cap_archives_only_unconsolidated_dropped_prefix(self, tmp_path):
+        from nanobot.session.manager import Session
+        archive_fn = MagicMock()
+        session = Session(key="cli:direct")
+        for i in range(8):
+            session.add_message("user", f"u{i}")
+        session.last_consolidated = 2
+
+        session.enforce_file_cap(on_archive=archive_fn, limit=4)
+
+        assert len(session.messages) <= 4
+        archive_fn.assert_called_once()
+        archived = archive_fn.call_args.args[0]
+        assert [m["content"] for m in archived] == ["u2", "u3"]
 
 
 class TestAutoCompact:
@@ -187,7 +264,6 @@ class TestAutoCompact:
     async def test_auto_compact_empty_session(self, tmp_path):
         """_archive on empty session should not archive."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
-        session = loop.sessions.get_or_create("cli:test")
 
         archive_called = False
 
@@ -944,14 +1020,14 @@ class TestSummaryPersistence:
 
         assert summary is not None
         assert "User said hello." in summary
-        assert "Inactive for" in summary
-        # Metadata should be cleaned up after consumption
-        assert "_last_summary" not in reloaded.metadata
+        assert "Previous conversation summary" in summary
+        # _last_summary persists in metadata for restart survival.
+        assert "_last_summary" in reloaded.metadata
         await loop.close_mcp()
 
     @pytest.mark.asyncio
-    async def test_metadata_cleanup_no_leak(self, tmp_path):
-        """_last_summary should be removed from metadata after being consumed."""
+    async def test_metadata_persists_for_restart(self, tmp_path):
+        """_last_summary stays in metadata so it survives process restarts."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
         session = loop.sessions.get_or_create("cli:test")
         _add_turns(session, 6, prefix="hello")
@@ -970,14 +1046,14 @@ class TestSummaryPersistence:
         loop.sessions.invalidate("cli:test")
         reloaded = loop.sessions.get_or_create("cli:test")
 
-        # First call: consumes from metadata
+        # Every call returns the summary from metadata (no _consumed_keys gate)
         _, summary = loop.auto_compact.prepare_session(reloaded, "cli:test")
         assert summary is not None
-
-        # Second call: no summary (already consumed)
         _, summary2 = loop.auto_compact.prepare_session(reloaded, "cli:test")
-        assert summary2 is None
-        assert "_last_summary" not in reloaded.metadata
+        assert summary2 is not None
+        assert "Summary." in summary2
+        # _last_summary persists in metadata for restart survival.
+        assert "_last_summary" in reloaded.metadata
         await loop.close_mcp()
 
     @pytest.mark.asyncio
@@ -1005,6 +1081,79 @@ class TestSummaryPersistence:
         # In-memory path is taken (no restart)
         _, summary = loop.auto_compact.prepare_session(reloaded, "cli:test")
         assert summary is not None
-        # Metadata should also be cleaned up
-        assert "_last_summary" not in reloaded.metadata
+        # _last_summary persists in metadata for restart survival.
+        assert "_last_summary" in reloaded.metadata
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_new_summary_overrides_old(self, tmp_path):
+        """A fresh archive writes a new summary that replaces the old one."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        _add_turns(session, 6, prefix="hello")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages, session=None):
+            return "First summary."
+
+        loop.consolidator.archive = _fake_archive
+        await loop.auto_compact._archive("cli:test")
+
+        # Consume the first summary via hot path
+        _, summary1 = loop.auto_compact.prepare_session(
+            loop.sessions.get_or_create("cli:test"), "cli:test"
+        )
+        assert summary1 is not None
+        assert "First summary." in summary1
+        assert "cli:test" not in loop.auto_compact._summaries  # popped by hot path
+
+        # Add new messages and archive again (simulating a later turn)
+        _add_turns(session, 4, prefix="world")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive2(messages, session=None):
+            return "Second summary."
+
+        loop.consolidator.archive = _fake_archive2
+        await loop.auto_compact._archive("cli:test")
+
+        # The second archive writes a new summary
+        assert "cli:test" in loop.auto_compact._summaries
+
+        # prepare_session must return the new summary
+        reloaded = loop.sessions.get_or_create("cli:test")
+        _, summary2 = loop.auto_compact.prepare_session(reloaded, "cli:test")
+        assert summary2 is not None
+        assert "Second summary." in summary2
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_new_command_clears_last_summary(self, tmp_path):
+        """/new should clear _last_summary so the new session starts fresh."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        _add_turns(session, 6, prefix="hello")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        async def _fake_archive(messages, session=None):
+            return "Old summary."
+
+        loop.consolidator.archive = _fake_archive
+        await loop.auto_compact._archive("cli:test")
+
+        # Verify summary exists before /new
+        reloaded = loop.sessions.get_or_create("cli:test")
+        assert "_last_summary" in reloaded.metadata
+
+        # Simulate /new command
+        session.clear()
+        loop.sessions.save(session)
+        loop.sessions.invalidate(session.key)
+
+        # After /new, metadata should no longer contain _last_summary
+        fresh = loop.sessions.get_or_create("cli:test")
+        assert "_last_summary" not in fresh.metadata
         await loop.close_mcp()

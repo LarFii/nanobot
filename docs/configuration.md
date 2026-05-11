@@ -53,15 +53,18 @@ IMAP_PASSWORD=your-password-here
 > - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, set `"apiBase": "https://open.bigmodel.cn/api/coding/paas/v4"` in your zhipu provider config.
 > - **Alibaba Cloud BaiLian**: If you're using Alibaba Cloud BaiLian's OpenAI-compatible endpoint, set `"apiBase": "https://dashscope.aliyuncs.com/compatible-mode/v1"` in your dashscope provider config.
 > - **Step Fun (Mainland China)**: If your API key is from Step Fun's mainland China platform (stepfun.com), set `"apiBase": "https://api.stepfun.com/v1"` in your stepfun provider config.
+> - **Xiaomi MiMo thinking mode**: MiMo models (e.g. `mimo-v2.5-pro`) default to enabled thinking. Use `agents.defaults.reasoningEffort: "none"` to disable it, or `"low"` / `"medium"` / `"high"` to keep it on. Omitting the field preserves the provider's per-model default.
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
 | `custom` | Any OpenAI-compatible endpoint | — |
 | `openrouter` | LLM (recommended, access to all models) | [openrouter.ai](https://openrouter.ai) |
+| `huggingface` | LLM (Hugging Face Inference Providers) | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) |
 | `volcengine` | LLM (VolcEngine, pay-per-use) | [Coding Plan](https://www.volcengine.com/activity/codingplan?utm_campaign=nanobot&utm_content=nanobot&utm_medium=devrel&utm_source=OWO&utm_term=nanobot) · [volcengine.com](https://www.volcengine.com) |
 | `byteplus` | LLM (VolcEngine international, pay-per-use) | [Coding Plan](https://www.byteplus.com/en/activity/codingplan?utm_campaign=nanobot&utm_content=nanobot&utm_medium=devrel&utm_source=OWO&utm_term=nanobot) · [byteplus.com](https://www.byteplus.com) |
 | `anthropic` | LLM (Claude direct) | [console.anthropic.com](https://console.anthropic.com) |
 | `azure_openai` | LLM (Azure OpenAI) | [portal.azure.com](https://portal.azure.com) |
+| `bedrock` | LLM (AWS Bedrock Converse, Claude/Nova/Llama/etc.) | [aws.amazon.com/bedrock](https://aws.amazon.com/bedrock/) |
 | `openai` | LLM + Voice transcription (Whisper) | [platform.openai.com](https://platform.openai.com) |
 | `deepseek` | LLM (DeepSeek direct) | [platform.deepseek.com](https://platform.deepseek.com) |
 | `groq` | LLM + Voice transcription (Whisper, default) | [console.groq.com](https://console.groq.com) |
@@ -74,6 +77,7 @@ IMAP_PASSWORD=your-password-here
 | `moonshot` | LLM (Moonshot/Kimi) | [platform.moonshot.cn](https://platform.moonshot.cn) |
 | `zhipu` | LLM (Zhipu GLM) | [open.bigmodel.cn](https://open.bigmodel.cn) |
 | `mimo` | LLM (MiMo) | [platform.xiaomimimo.com](https://platform.xiaomimimo.com) |
+| `longcat` | LLM (LongCat) | [longcat.chat](https://longcat.chat/platform/docs/zh/) |
 | `ollama` | LLM (local, Ollama) | — |
 | `lm_studio` | LLM (local, LM Studio) | — |
 | `mistral` | LLM | [docs.mistral.ai](https://docs.mistral.ai/) |
@@ -83,6 +87,183 @@ IMAP_PASSWORD=your-password-here
 | `openai_codex` | LLM (Codex, OAuth) | `nanobot provider login openai-codex` |
 | `github_copilot` | LLM (GitHub Copilot, OAuth) | `nanobot provider login github-copilot` |
 | `qianfan` | LLM (Baidu Qianfan) | [cloud.baidu.com](https://cloud.baidu.com/doc/qianfan/s/Hmh4suq26) |
+
+<details>
+<summary><b>AWS Bedrock (Converse API)</b></summary>
+
+Bedrock uses the native `bedrock-runtime` Converse API, so it can call Bedrock model IDs such as Claude Opus 4.7, Claude Sonnet, Amazon Nova, Meta Llama, Mistral, Qwen, and other models that support Converse. It supports normal chat, streaming, tool calling, tool results, token usage, and Bedrock error metadata.
+
+This provider is for Bedrock's native Converse API, not Bedrock's OpenAI-compatible `/openai/v1` endpoint. For OpenAI-compatible Bedrock models, you can still use `custom` if you specifically want that API surface.
+
+**1. Configure credentials**
+
+Use the normal AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, an AWS profile, or an IAM role). The IAM identity needs:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream"
+  ],
+  "Resource": "*"
+}
+```
+
+You can also set `providers.bedrock.apiKey` to a Bedrock API key; nanobot exports it as `AWS_BEARER_TOKEN_BEDROCK` for the AWS SDK.
+
+Credential options:
+
+- **AWS CLI/default profile**: leave `apiKey` and `profile` empty, then run `aws configure` or provide `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+- **Named AWS profile**: set `profile` to a profile from `~/.aws/config` or `~/.aws/credentials`.
+- **IAM role**: on EC2/ECS/Lambda, leave `apiKey` and `profile` empty and attach a role with Bedrock permissions.
+- **Bedrock API key**: set `apiKey` or `AWS_BEARER_TOKEN_BEDROCK`; `profile` can stay `null`.
+
+**2. Minimal config**
+
+For a non-Anthropic model such as Amazon Nova:
+
+```json
+{
+  "providers": {
+    "bedrock": {
+      "region": "us-east-1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "bedrock",
+      "model": "bedrock/amazon.nova-lite-v1:0",
+      "reasoningEffort": null
+    }
+  }
+}
+```
+
+With a Bedrock API key:
+
+```json
+{
+  "providers": {
+    "bedrock": {
+      "region": "us-east-1",
+      "apiKey": "${AWS_BEARER_TOKEN_BEDROCK}"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "bedrock",
+      "model": "bedrock/amazon.nova-lite-v1:0",
+      "reasoningEffort": null
+    }
+  }
+}
+```
+
+With a named AWS profile:
+
+```json
+{
+  "providers": {
+    "bedrock": {
+      "region": "us-east-1",
+      "profile": "my-bedrock-profile"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "bedrock",
+      "model": "bedrock/amazon.nova-lite-v1:0"
+    }
+  }
+}
+```
+
+**3. Claude Opus 4.7 example**
+
+```json
+{
+  "providers": {
+    "bedrock": {
+      "region": "us-east-1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "bedrock",
+      "model": "bedrock/global.anthropic.claude-opus-4-7",
+      "reasoningEffort": "medium",
+      "maxTokens": 8192
+    }
+  }
+}
+```
+
+For regional routing, use one of Bedrock's inference IDs, for example `bedrock/us.anthropic.claude-opus-4-7`, `bedrock/eu.anthropic.claude-opus-4-7`, or `bedrock/jp.anthropic.claude-opus-4-7`.
+
+Claude Opus 4.7 does not accept `temperature`, `top_p`, or `top_k`; nanobot omits `temperature` automatically for this model. If `reasoningEffort` is set to `low`, `medium`, `high`, `max`, or `adaptive`, nanobot sends Bedrock's adaptive thinking parameter.
+
+Anthropic models on Bedrock can also require Anthropic use-case registration and are subject to Anthropic-supported country/region restrictions. If Claude fails with a `ValidationException` about unsupported countries or regions, try a non-Anthropic Bedrock model such as Amazon Nova to verify the provider setup.
+
+**4. Model IDs**
+
+Use Bedrock model IDs or inference profile IDs with a `bedrock/` prefix in nanobot config. nanobot removes the prefix before calling AWS.
+
+Examples:
+
+- `bedrock/amazon.nova-micro-v1:0`
+- `bedrock/amazon.nova-lite-v1:0`
+- `bedrock/global.anthropic.claude-opus-4-7`
+- `bedrock/us.anthropic.claude-opus-4-7`
+- `bedrock/openai.gpt-oss-20b-1:0`
+- `bedrock/meta.llama...`
+- `bedrock/mistral...`
+
+Check the Bedrock console for the exact model ID and region availability. Some models require cross-region inference profile IDs such as `us.*`, `eu.*`, or `global.*`.
+
+**5. Advanced model fields**
+
+Model-specific fields can be supplied with `extraBody`; nanobot merges it into Converse `additionalModelRequestFields`:
+
+```json
+{
+  "providers": {
+    "bedrock": {
+      "region": "us-east-1",
+      "extraBody": {
+        "thinking": {
+          "type": "adaptive",
+          "effort": "medium",
+          "display": "summarized"
+        }
+      }
+    }
+  }
+}
+```
+
+Use `apiBase` only for a custom Bedrock Runtime endpoint URL, such as a VPC endpoint or proxy. It is not needed for normal AWS regions.
+
+Current scope: nanobot passes `messages`, `system`, `inferenceConfig`, `toolConfig`, and `additionalModelRequestFields`. Bedrock Prompt Management, Guardrails, `serviceTier`, and other top-level Converse options are not first-class config fields yet.
+
+**6. Quick checks**
+
+```bash
+# For AWS credential-chain usage:
+aws sts get-caller-identity
+
+# For API-key usage:
+export AWS_BEARER_TOKEN_BEDROCK="your-bedrock-api-key"
+export AWS_REGION="us-east-1"
+```
+
+Then run:
+
+```bash
+nanobot agent -m "Reply with one short sentence."
+```
+
+</details>
 
 
 <details>
@@ -161,6 +342,34 @@ nanobot agent -c ~/.nanobot-telegram/config.json -w /tmp/nanobot-telegram-test -
 </details>
 
 <details>
+<summary><b>LongCat (OpenAI-compatible)</b></summary>
+
+LongCat is available through nanobot's built-in OpenAI-compatible provider flow.
+The default API base already points to `https://api.longcat.chat/openai/v1`, so you
+usually only need to set `apiKey`.
+
+```json
+{
+  "providers": {
+    "longcat": {
+      "apiKey": "${LONGCAT_API_KEY}"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "longcat",
+      "model": "LongCat-Flash-Chat"
+    }
+  }
+}
+```
+
+Official model names include `LongCat-Flash-Chat`, `LongCat-Flash-Thinking`,
+`LongCat-Flash-Thinking-2601`, and `LongCat-Flash-Lite`.
+
+</details>
+
+<details>
 <summary><b>Custom Provider (Any OpenAI-compatible API)</b></summary>
 
 Connects directly to any OpenAI-compatible endpoint — llama.cpp, Together AI, Fireworks, Azure OpenAI, or any self-hosted server. Model name is passed as-is.
@@ -206,6 +415,25 @@ Connects directly to any OpenAI-compatible endpoint — llama.cpp, Together AI, 
 > ```
 >
 > In short: **chat-completions-compatible endpoint → `custom`**; **Responses-compatible endpoint → `azure_openai`**.
+
+Some OpenAI-compatible gateways expose request-body extensions such as vLLM guided decoding or local sampling controls. Put those under `extraBody`; nanobot merges them into the chat-completions request body after its provider defaults:
+
+```json
+{
+  "providers": {
+    "custom": {
+      "apiKey": "your-api-key",
+      "apiBase": "https://api.your-provider.com/v1",
+      "extraBody": {
+        "repetition_penalty": 1.15,
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      }
+    }
+  }
+}
+```
 
 </details>
 
@@ -454,6 +682,26 @@ Global settings that apply to all channels. Configure under the `channels` secti
 | `transcriptionProvider` | `"groq"` | Voice transcription backend: `"groq"` (free tier, default) or `"openai"`. API key is auto-resolved from the matching provider config. |
 | `transcriptionLanguage` | `null` | Optional ISO-639-1 language hint for audio transcription, e.g. `"en"`, `"ko"`, `"ja"`. |
 
+`sendProgress` and `sendToolHints` can also be overridden per channel. The
+global values stay as defaults for channels that do not set their own value:
+
+```json
+{
+  "channels": {
+    "sendProgress": true,
+    "sendToolHints": false,
+    "telegram": {
+      "enabled": true,
+      "sendProgress": false
+    },
+    "websocket": {
+      "enabled": true,
+      "sendToolHints": true
+    }
+  }
+}
+```
+
 ### Retry Behavior
 
 Retry is intentionally simple.
@@ -474,19 +722,21 @@ When a channel `send()` raises, nanobot retries at the channel-manager layer. By
 >
 > If a channel is completely unreachable, nanobot cannot notify the user through that same channel. Watch logs for `Failed to send to {channel} after N attempts` to spot persistent delivery failures.
 
-## Web Search
+## Web Tools
 
-> [!TIP]
-> Use `proxy` in `tools.web` to route all web requests (search + fetch) through a proxy:
-> ```json
-> { "tools": { "web": { "proxy": "http://127.0.0.1:7890" } } }
-> ```
+nanobot incorporates basic tools for accessing the web. These include searching via APIs, and fetching arbitrary web pages in Markdown format. They are enabled by default, and can be configured in `~/.nanobot/config.json` under `tools.web`.
 
-nanobot supports multiple web search providers. Configure in `~/.nanobot/config.json` under `tools.web.search`.
+If you want to disable them, which removes both `web_search` and `web_fetch` from the tool list sent to the LLM, set `tools.web.enable` to `false`:
 
-By default, web tools are enabled and web search uses `duckduckgo`, so search works out of the box without an API key.
-
-If you want to disable all built-in web tools entirely, set `tools.web.enable` to `false`. This removes both `web_search` and `web_fetch` from the tool list sent to the LLM.
+```json
+{
+  "tools": {
+    "web": {
+      "enable": false
+    }
+  }
+}
+```
 
 If you need to allow trusted private ranges such as Tailscale / CGNAT addresses, you can explicitly exempt them from SSRF blocking with `tools.ssrfWhitelist`:
 
@@ -498,25 +748,35 @@ If you need to allow trusted private ranges such as Tailscale / CGNAT addresses,
 }
 ```
 
+> [!TIP]
+> Use `proxy` in `tools.web` to route all web requests (search + fetch) through a proxy:
+> ```json
+> { "tools": { "web": { "proxy": "http://127.0.0.1:7890" } } }
+> ```
+
+### `tools.web`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | boolean | `true` | Enable or disable all built-in web tools (`web_search` + `web_fetch`) |
+| `proxy` | string or null | `null` | Proxy for all web requests, for example `http://127.0.0.1:7890` |
+| `userAgent` | string or null | `null` | User-Agent header for all web requests. If null, a browser one will be used |
+
+### Web Search
+
+nanobot supports multiple web search providers. Configure in `~/.nanobot/config.json` under `tools.web.search`.
+
+By default, web search uses `duckduckgo`, and it works out of the box without an API key.
+
 | Provider | Config fields | Env var fallback | Free |
 |----------|--------------|------------------|------|
 | `brave` | `apiKey` | `BRAVE_API_KEY` | No |
 | `tavily` | `apiKey` | `TAVILY_API_KEY` | No |
 | `jina` | `apiKey` | `JINA_API_KEY` | Free tier (10M tokens) |
 | `kagi` | `apiKey` | `KAGI_API_KEY` | No |
+| `olostep` | `apiKey` | `OLOSTEP_API_KEY` | No |
 | `searxng` | `baseUrl` | `SEARXNG_BASE_URL` | Yes (self-hosted) |
 | `duckduckgo` (default) | — | — | Yes |
-
-**Disable all built-in web tools:**
-```json
-{
-  "tools": {
-    "web": {
-      "enable": false
-    }
-  }
-}
-```
 
 **Brave:**
 ```json
@@ -574,6 +834,22 @@ If you need to allow trusted private ranges such as Tailscale / CGNAT addresses,
 }
 ```
 
+**Olostep:**
+```json
+{
+  "tools": {
+    "web": {
+      "search": {
+        "provider": "olostep",
+        "apiKey": "YOUR_OLOSTEP_API_KEY"
+      }
+    }
+  }
+}
+```
+
+You can also set `OLOSTEP_API_KEY` in the environment instead of storing it in config.
+
 **SearXNG** (self-hosted, no API key needed):
 ```json
 {
@@ -601,12 +877,7 @@ If you need to allow trusted private ranges such as Tailscale / CGNAT addresses,
 }
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable` | boolean | `true` | Enable or disable all built-in web tools (`web_search` + `web_fetch`) |
-| `proxy` | string or null | `null` | Proxy for all web requests, for example `http://127.0.0.1:7890` |
-
-### `tools.web.search`
+#### `tools.web.search`
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -614,6 +885,42 @@ If you need to allow trusted private ranges such as Tailscale / CGNAT addresses,
 | `apiKey` | string | `""` | API key for Brave or Tavily |
 | `baseUrl` | string | `""` | Base URL for SearXNG |
 | `maxResults` | integer | `5` | Results per search (1–10) |
+
+### Web Fetch
+
+> [!TIP]
+> If you are having issues with JS proof-of-work or Cloudflare captchas, set a random user agent and disable Jina Reader:
+> ```json
+> { "tools": { "web": { "userAgent": "Not-A-Browser", "fetch": { "useJinaReader": false } } } }
+> ```
+
+nanobot by default uses [Jina Reader](https://jina.ai/reader/), a third-party API, to convert arbitrary pages into Markdown format for easy digestion by the LLM, with a local fallback based on [readability-lxml](https://github.com/buriy/python-readability) if the former fails.
+
+If you want to always use the local conversion, you can force it using:
+
+```json
+{
+  "tools": {
+    "web": {
+      "fetch": {
+        "useJinaReader": false
+      }
+    }
+  }
+}
+```
+
+#### `tools.web.fetch`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `useJinaReader` | boolean | `true` | If true, Jina Reader will be preferred over the local conversion |
+
+## Image Generation
+
+Image generation is configured under `tools.imageGeneration` and uses provider credentials from `providers.openrouter` or `providers.aihubmix`.
+
+See [Image Generation](./image-generation.md) for WebUI usage, provider examples, artifact storage, and troubleshooting.
 
 ## MCP (Model Context Protocol)
 
@@ -707,6 +1014,28 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `channels.*.allowFrom` | `[]` (deny all) | Whitelist of user IDs. Empty denies all; use `["*"]` to allow everyone. |
 
 **Docker security**: The official Docker image runs as a non-root user (`nanobot`, UID 1000) with bubblewrap pre-installed. When using `docker-compose.yml`, the container drops all Linux capabilities except `SYS_ADMIN` (required for bwrap's namespace isolation).
+
+
+## Subagent Concurrency
+
+By default, nanobot only allows one spawned subagent at a time. When the limit is
+reached, the `spawn` tool returns an error so the agent can decide to wait or
+rearrange its work. This protects local LLM servers from loading multiple KV caches
+at once. If your provider can handle more parallel work, raise the limit:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "maxConcurrentSubagents": 2
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.maxConcurrentSubagents` | `1` | Maximum number of spawned subagents that may run at the same time. Attempts to spawn beyond this limit return an error. |
 
 
 ## Auto Compact
@@ -809,3 +1138,23 @@ Disabled skills are excluded from the main agent's skill summary, from always-on
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.disabledSkills` | `[]` | List of skill directory names to exclude from loading. Applies to both built-in skills and workspace skills. |
+
+## Tool Hint Max Length
+
+Tool hints are the short progress messages shown when the agent calls tools (e.g. `$ cd …/project && npm test`). By default, these are truncated at 40 characters, which can make long commands hard to read.
+
+Set `agents.defaults.toolHintMaxLength` to control the truncation threshold:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "toolHintMaxLength": 120
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.toolHintMaxLength` | `40` | Maximum characters for tool hint display. Range: 20–500. Higher values show more of the command or path; lower values keep hints compact. |

@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import uuid
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ def strip_think(text: str) -> str:
          explanatory prose that mentions these tokens.
       5. Orphan closing tags `</think>` / `</thought>` **at the very start
          or end of the text** only, for the same reason.
+      6. Trailing partial control tags split across stream chunks, such as
+         `<thi`, `<thin`, or `<tho`.
 
     Since this is also applied before persisting to history (memory.py),
     the edge-only stripping of (4) and (5) is deliberate: stripping those
@@ -57,6 +60,14 @@ def strip_think(text: str) -> str:
     text = re.sub(r"\s*</thought>\s*$", "", text)
     # Edge-only channel markers (harmony / Gemma 4 variant leaks).
     text = re.sub(r"^\s*<\|?channel\|?>\s*", "", text)
+    # Stream chunks may end in the middle of a control tag. Strip only known
+    # control-token prefixes at the very end.
+    partial_control_tag = (
+        r"</?(?:t|th|thi|thin|think|tho|thou|thoug|though|thought)>?"
+        r"|<\|?(?:c|ch|cha|chan|chann|channe|channel)(?:\|?>?)?"
+    )
+    text = re.sub(rf"(?:{partial_control_tag})$", "", text)
+    text = re.sub(r"^\s*<\|?$", "", text)
     return text.strip()
 
 
@@ -154,11 +165,6 @@ def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
             if tid and str(tid) not in declared:
                 start = i + 1
                 declared.clear()
-                for prev in messages[start : i + 1]:
-                    if prev.get("role") == "assistant":
-                        for tc in prev.get("tool_calls") or []:
-                            if isinstance(tc, dict) and tc.get("id"):
-                                declared.add(str(tc["id"]))
     return start
 
 
@@ -257,8 +263,8 @@ def maybe_persist_tool_result(
     bucket = ensure_dir(root / safe_filename(session_key or "default"))
     try:
         _cleanup_tool_result_buckets(root, bucket)
-    except Exception as exc:
-        logger.warning("Failed to clean stale tool result buckets in {}: {}", root, exc)
+    except Exception:
+        logger.exception("Failed to clean stale tool result buckets in {}", root)
     path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
     if not path.exists():
         if suffix == "json" and isinstance(content, list):
@@ -416,13 +422,10 @@ def estimate_prompt_tokens_chain(
     """Estimate prompt tokens via provider counter first, then tiktoken fallback."""
     provider_counter = getattr(provider, "estimate_prompt_tokens", None)
     if callable(provider_counter):
-        try:
+        with suppress(Exception):
             tokens, source = provider_counter(messages, tools, model)
             if isinstance(tokens, (int, float)) and tokens > 0:
                 return int(tokens), str(source or "provider_counter")
-        except Exception:
-            pass
-
     estimated = estimate_prompt_tokens(messages, tools)
     if estimated > 0:
         return int(estimated), "tiktoken"
@@ -532,6 +535,6 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         )
         gs.init()
     except Exception:
-        logger.warning("Failed to initialize git store for {}", workspace)
+        logger.exception("Failed to initialize git store for {}", workspace)
 
     return added

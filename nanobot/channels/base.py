@@ -26,6 +26,8 @@ class BaseChannel(ABC):
     transcription_api_key: str = ""
     transcription_api_base: str = ""
     transcription_language: str | None = None
+    send_progress: bool = True
+    send_tool_hints: bool = False
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -36,6 +38,7 @@ class BaseChannel(ABC):
             bus: The message bus for communication.
         """
         self.config = config
+        self.logger = logger.bind(channel=self.name)
         self.bus = bus
         self._running = False
 
@@ -59,8 +62,8 @@ class BaseChannel(ABC):
                     language=self.transcription_language or None,
                 )
             return await provider.transcribe(file_path)
-        except Exception as e:
-            logger.warning("{}: audio transcription failed: {}", self.name, e)
+        except Exception:
+            self.logger.exception("Audio transcription failed")
             return ""
 
     async def login(self, force: bool = False) -> bool:
@@ -134,7 +137,7 @@ class BaseChannel(ABC):
         else:
             allow_list = getattr(self.config, "allow_from", [])
         if not allow_list:
-            logger.warning("{}: allow_from is empty — all access denied", self.name)
+            self.logger.warning("allow_from is empty — all access denied")
             return False
         if "*" in allow_list:
             return True
@@ -163,10 +166,10 @@ class BaseChannel(ABC):
             session_key: Optional session key override (e.g. thread-scoped sessions).
         """
         if not self.is_allowed(sender_id):
-            logger.warning(
-                "Access denied for sender {} on channel {}. "
+            self.logger.warning(
+                "Access denied for sender {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                sender_id,
             )
             return
 

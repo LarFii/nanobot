@@ -2,8 +2,9 @@
 
 import asyncio
 import os
+import re
 import shutil
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from typing import Any
 
 import httpx
@@ -27,6 +28,15 @@ _TRANSIENT_EXC_NAMES: frozenset[str] = frozenset((
 ))
 
 _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yarn", "bunx"))
+
+# Characters allowed in tool names by model providers (Anthropic, OpenAI, etc.).
+# Replace anything outside [a-zA-Z0-9_-] with underscore and collapse runs.
+_SANITIZE_RE = re.compile(r"_+")
+
+
+def _sanitize_name(name: str) -> str:
+    """Sanitize an MCP-derived name for model API compatibility."""
+    return _SANITIZE_RE.sub("_", re.sub(r"[^a-zA-Z0-9_-]", "_", name))
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -137,7 +147,7 @@ class MCPToolWrapper(Tool):
     def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
         self._session = session
         self._original_name = tool_def.name
-        self._name = f"mcp_{server_name}_{tool_def.name}"
+        self._name = _sanitize_name(f"mcp_{server_name}_{tool_def.name}")
         self._description = tool_def.description or tool_def.name
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
@@ -188,11 +198,10 @@ class MCPToolWrapper(Tool):
                         await asyncio.sleep(1)  # Brief backoff before retry
                         continue
                     # Second transient failure — give up with retry-specific message
-                    logger.error(
-                        "MCP tool '{}' failed after retry: {}: {}",
+                    logger.exception(
+                        "MCP tool '{}' failed after retry: {}",
                         self._name,
                         type(exc).__name__,
-                        exc,
                     )
                     return f"(MCP tool call failed after retry: {type(exc).__name__})"
                 logger.exception(
@@ -221,7 +230,7 @@ class MCPResourceWrapper(Tool):
     def __init__(self, session, server_name: str, resource_def, resource_timeout: int = 30):
         self._session = session
         self._uri = resource_def.uri
-        self._name = f"mcp_{server_name}_resource_{resource_def.name}"
+        self._name = _sanitize_name(f"mcp_{server_name}_resource_{resource_def.name}")
         desc = resource_def.description or resource_def.name
         self._description = f"[MCP Resource] {desc}\nURI: {self._uri}"
         self._parameters: dict[str, Any] = {
@@ -277,11 +286,10 @@ class MCPResourceWrapper(Tool):
                         )
                         await asyncio.sleep(1)
                         continue
-                    logger.error(
-                        "MCP resource '{}' failed after retry: {}: {}",
+                    logger.exception(
+                        "MCP resource '{}' failed after retry: {}",
                         self._name,
                         type(exc).__name__,
-                        exc,
                     )
                     return f"(MCP resource read failed after retry: {type(exc).__name__})"
                 logger.exception(
@@ -311,7 +319,7 @@ class MCPPromptWrapper(Tool):
     def __init__(self, session, server_name: str, prompt_def, prompt_timeout: int = 30):
         self._session = session
         self._prompt_name = prompt_def.name
-        self._name = f"mcp_{server_name}_prompt_{prompt_def.name}"
+        self._name = _sanitize_name(f"mcp_{server_name}_prompt_{prompt_def.name}")
         desc = prompt_def.description or prompt_def.name
         self._description = (
             f"[MCP Prompt] {desc}\n"
@@ -373,7 +381,7 @@ class MCPPromptWrapper(Tool):
                 logger.warning("MCP prompt '{}' was cancelled by server/SDK", self._name)
                 return "(MCP prompt call was cancelled)"
             except McpError as exc:
-                logger.error(
+                logger.exception(
                     "MCP prompt '{}' failed: code={} message={}",
                     self._name,
                     exc.error.code,
@@ -390,11 +398,10 @@ class MCPPromptWrapper(Tool):
                         )
                         await asyncio.sleep(1)
                         continue
-                    logger.error(
-                        "MCP prompt '{}' failed after retry: {}: {}",
+                    logger.exception(
+                        "MCP prompt '{}' failed after retry: {}",
                         self._name,
                         type(exc).__name__,
-                        exc,
                     )
                     return f"(MCP prompt call failed after retry: {type(exc).__name__})"
                 logger.exception(
@@ -429,8 +436,8 @@ async def connect_mcp_servers(
     """Connect to configured MCP servers and register their tools, resources, prompts.
 
     Returns a dict mapping server name -> its dedicated AsyncExitStack.
-    Each server gets its own stack and runs in its own task to prevent
-    cancel scope conflicts when multiple MCP servers are configured.
+    Each server gets its own stack to prevent cancel scope conflicts
+    when multiple MCP servers are configured.
     """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
@@ -514,9 +521,9 @@ async def connect_mcp_servers(
             registered_count = 0
             matched_enabled_tools: set[str] = set()
             available_raw_names = [tool_def.name for tool_def in tools.tools]
-            available_wrapped_names = [f"mcp_{name}_{tool_def.name}" for tool_def in tools.tools]
+            available_wrapped_names = [_sanitize_name(f"mcp_{name}_{tool_def.name}") for tool_def in tools.tools]
             for tool_def in tools.tools:
-                wrapped_name = f"mcp_{name}_{tool_def.name}"
+                wrapped_name = _sanitize_name(f"mcp_{name}_{tool_def.name}")
                 if (
                     not allow_all_tools
                     and tool_def.name not in enabled_tools
@@ -598,28 +605,20 @@ async def connect_mcp_servers(
                     " Hint: this looks like stdio protocol pollution. Make sure the MCP server writes "
                     "only JSON-RPC to stdout and sends logs/debug output to stderr instead."
                 )
-            logger.error("MCP server '{}': failed to connect: {}{}", name, e, hint)
-            try:
+            logger.exception("MCP server '{}': failed to connect: {}", name, hint)
+            with suppress(Exception):
                 await server_stack.aclose()
-            except Exception:
-                pass
             return name, None
 
     server_stacks: dict[str, AsyncExitStack] = {}
 
-    tasks: list[asyncio.Task] = []
     for name, cfg in mcp_servers.items():
-        task = asyncio.create_task(connect_single_server(name, cfg))
-        tasks.append(task)
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, result in enumerate(results):
-        name = list(mcp_servers.keys())[i]
-        if isinstance(result, BaseException):
-            if not isinstance(result, asyncio.CancelledError):
-                logger.error("MCP server '{}' connection task failed: {}", name, result)
-        elif result is not None and result[1] is not None:
+        try:
+            result = await connect_single_server(name, cfg)
+        except Exception as e:
+            logger.exception("MCP server '{}' connection failed: {}", name, e)
+            continue
+        if result is not None and result[1] is not None:
             server_stacks[result[0]] = result[1]
 
     return server_stacks

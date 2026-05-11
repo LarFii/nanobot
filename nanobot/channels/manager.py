@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,9 +29,14 @@ def _default_webui_dist() -> Path | None:
     candidate = Path(web_pkg.__file__).resolve().parent / "dist"
     return candidate if candidate.is_dir() else None
 
+
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
 
+_BOOL_CAMEL_ALIASES: dict[str, str] = {
+    "send_progress": "sendProgress",
+    "send_tool_hints": "sendToolHints",
+}
 
 class ChannelManager:
     """
@@ -53,6 +60,7 @@ class ChannelManager:
         self._session_manager = session_manager
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
 
         self._init_channels()
 
@@ -90,6 +98,12 @@ class ChannelManager:
                 channel.transcription_api_key = transcription_key
                 channel.transcription_api_base = transcription_base
                 channel.transcription_language = transcription_language
+                channel.send_progress = self._resolve_bool_override(
+                    section, "send_progress", self.config.channels.send_progress,
+                )
+                channel.send_tool_hints = self._resolve_bool_override(
+                    section, "send_tool_hints", self.config.channels.send_tool_hints,
+                )
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
             except Exception as e:
@@ -131,12 +145,37 @@ class ChannelManager:
                     f'Set ["*"] to allow everyone, or add specific user IDs.'
                 )
 
+    def _should_send_progress(self, channel_name: str, *, tool_hint: bool = False) -> bool:
+        """Return whether progress (or tool-hints) may be sent to *channel_name*."""
+        ch = self.channels.get(channel_name)
+        if ch is None:
+            logger.warning("Progress check for unknown channel: {}", channel_name)
+            return False
+        return ch.send_tool_hints if tool_hint else ch.send_progress
+
+    def _resolve_bool_override(self, section: Any, key: str, default: bool) -> bool:
+        """Return *key* from *section* if it is a bool, otherwise *default*.
+
+        For dict configs also checks the camelCase alias (e.g. ``sendProgress``
+        for ``send_progress``) so raw JSON/TOML configs work alongside
+        Pydantic models.
+        """
+        if isinstance(section, dict):
+            value = section.get(key)
+            if value is None:
+                camel = _BOOL_CAMEL_ALIASES.get(key)
+                if camel:
+                    value = section.get(camel)
+            return value if isinstance(value, bool) else default
+        value = getattr(section, key, None)
+        return value if isinstance(value, bool) else default
+
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
         try:
             await channel.start()
-        except Exception as e:
-            logger.error("Failed to start channel {}: {}", name, e)
+        except Exception:
+            logger.exception("Failed to start channel {}", name)
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
@@ -172,6 +211,7 @@ class ChannelManager:
                 channel=notice.channel,
                 chat_id=notice.chat_id,
                 content=format_restart_completed_message(notice.started_at_raw),
+                metadata=dict(notice.metadata or {}),
             ),
         ))
 
@@ -182,18 +222,43 @@ class ChannelManager:
         # Stop dispatcher
         if self._dispatch_task:
             self._dispatch_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._dispatch_task
-            except asyncio.CancelledError:
-                pass
 
         # Stop all channels
         for name, channel in self.channels.items():
             try:
                 await channel.stop()
                 logger.info("Stopped {} channel", name)
-            except Exception as e:
-                logger.error("Error stopping {}: {}", name, e)
+            except Exception:
+                logger.exception("Error stopping {}", name)
+
+    @staticmethod
+    def _fingerprint_content(content: str) -> str:
+        normalized = " ".join(content.split())
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+    def _should_suppress_outbound(self, msg: OutboundMessage) -> bool:
+        metadata = msg.metadata or {}
+        if metadata.get("_progress"):
+            return False
+        fingerprint = self._fingerprint_content(msg.content)
+        if not fingerprint:
+            return False
+
+        origin_message_id = metadata.get("origin_message_id")
+        if isinstance(origin_message_id, str) and origin_message_id:
+            key = (msg.channel, msg.chat_id, origin_message_id)
+            if self._origin_reply_fingerprints.get(key) == fingerprint:
+                return True
+            self._origin_reply_fingerprints[key] = fingerprint
+
+        message_id = metadata.get("message_id")
+        if isinstance(message_id, str) and message_id:
+            key = (msg.channel, msg.chat_id, message_id)
+            self._origin_reply_fingerprints[key] = fingerprint
+
+        return False
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
@@ -215,9 +280,13 @@ class ChannelManager:
                     )
 
                 if msg.metadata.get("_progress"):
-                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                    if msg.metadata.get("_tool_hint") and not self._should_send_progress(
+                        msg.channel, tool_hint=True,
+                    ):
                         continue
-                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                    if not msg.metadata.get("_tool_hint") and not self._should_send_progress(
+                        msg.channel, tool_hint=False,
+                    ):
                         continue
 
                 if msg.metadata.get("_retry_wait"):
@@ -231,6 +300,16 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
+                    # Duplicate suppression is scoped to a known source message
+                    # so repeated content from separate turns is still delivered.
+                    if (
+                        not msg.metadata.get("_stream_delta")
+                        and not msg.metadata.get("_stream_end")
+                        and not msg.metadata.get("_streamed")
+                    ):
+                        if self._should_suppress_outbound(msg):
+                            logger.info("Suppressing duplicate outbound message to {}:{}", msg.channel, msg.chat_id)
+                            continue
                     await self._send_with_retry(channel, msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
@@ -313,9 +392,9 @@ class ChannelManager:
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
                 if attempt == max_attempts - 1:
-                    logger.error(
-                        "Failed to send to {} after {} attempts: {} - {}",
-                        msg.channel, max_attempts, type(e).__name__, e
+                    logger.exception(
+                        "Failed to send to {} after {} attempts",
+                        msg.channel, max_attempts
                     )
                     return
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
